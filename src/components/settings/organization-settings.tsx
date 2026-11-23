@@ -9,6 +9,7 @@ import { BrandingPanel } from "@/components/settings/branding-panel";
 import { EmbeddingPanel } from "@/components/settings/embedding-panel";
 import { Part11Panel } from "@/components/settings/part11-panel";
 import { PeoplePanel } from "@/components/settings/people-panel";
+import { SealKeyPanel } from "@/components/settings/seal-key-panel";
 import { SecurityPanel } from "@/components/settings/security-panel";
 import { SignerDataPanel } from "@/components/settings/signer-data-panel";
 import { TeamsPanel } from "@/components/settings/teams-panel";
@@ -605,6 +606,8 @@ export function OrganizationSettings({
             initialSessionMaxHours={values.sessionMaxHours}
           />
         ) : null}
+
+        <SealKeyPanel />
 
         {!values.hosted ? (
           <Part11Panel initialEnabled={values.part11Mode} />

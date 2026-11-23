@@ -40,6 +40,8 @@ const EVENT_LABELS: Record<SystemAuditEvent["event"], string> = {
   password_reset: "Password reset by email link",
   reauthentication_failed: "Wrong password while signing",
   role_changed: "Role changed",
+  seal_key_replaced: "New sealing key made",
+  seal_key_unreadable: "Sealing stopped: the sealing key cannot be read",
   settings_changed: "Settings changed",
   sign_in_failed: "Sign-in failed",
   sign_in_locked: "Sign-in stopped after wrong passwords",

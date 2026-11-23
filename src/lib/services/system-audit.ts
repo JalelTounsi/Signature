@@ -58,6 +58,8 @@ export const systemAuditEventTypes = [
   "team_deleted",
   "team_member_added",
   "team_member_removed",
+  "seal_key_unreadable",
+  "seal_key_replaced",
 ] as const;
 
 export type SystemAuditEventType = (typeof systemAuditEventTypes)[number];

@@ -13,6 +13,7 @@ import { PDFDocument } from "pdf-lib";
 import { getDb, withTransaction, type DbPool } from "../db/connection.ts";
 import type { Branding } from "../branding.ts";
 import { getBranding } from "../settings.ts";
+import { recordSystemAuditEvent } from "./system-audit.ts";
 import {
   isProduction,
   readEnv,
@@ -41,9 +42,12 @@ import {
 //    verified. Used as given, never stored.
 // 2. Otherwise a key the install makes for itself the first time it seals a
 //    document. The private key is kept in the seal_keys table, encrypted with
-//    a key derived from the auth secret. If that secret changes and the old
-//    key can no longer be read, a new one is made; documents sealed before
-//    still verify, because each carries its own certificate.
+//    a key derived from the auth secret. If that secret changes and the
+//    stored key can no longer be read, sealing stops with SealKeyError and
+//    the site's audit trail notes it. Nothing replaces the key by itself: an
+//    administrator either puts the earlier secret back or makes a new key
+//    (replaceUnreadableSealKey). Documents sealed before still verify,
+//    because each carries its own certificate.
 
 const KEY_CONTEXT = "signudoc/seal-key/v1";
 const SEAL_KEY_LOCK_ID = 746108325;
@@ -141,6 +145,119 @@ type SealKeyRow = {
   id: string;
 };
 
+/** A seal key problem an administrator has to settle. */
+export class SealKeyError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 500) {
+    super(message);
+    this.name = "SealKeyError";
+    this.statusCode = statusCode;
+  }
+}
+
+export const SEAL_KEY_UNREADABLE_MESSAGE =
+  "The key this site seals documents with cannot be read: it was stored under a different BETTER_AUTH_SECRET (or database password) than the one set now. Put the earlier secret back, or have an administrator make a new sealing key in Settings. No document can be sealed until then.";
+
+type DbTransaction = Parameters<Parameters<typeof withTransaction>[0]>[0];
+
+async function readActiveSealKey(
+  tx: DbTransaction,
+): Promise<SealKeyRow | undefined> {
+  // One instance makes the key; any other waits here and then reads it.
+  await tx.query("SELECT pg_advisory_xact_lock($1)", [SEAL_KEY_LOCK_ID]);
+
+  const existing = await tx.query<SealKeyRow>(
+    `
+      SELECT
+        id,
+        certificate_pem AS "certificatePem",
+        encrypted_private_key AS "encryptedPrivateKey"
+      FROM seal_keys
+      WHERE retired_at IS NULL
+      LIMIT 1
+    `,
+  );
+
+  return existing.rows[0];
+}
+
+/** Makes a key, stores it as the active one and retires any before it. */
+async function storeNewSealKey(
+  tx: DbTransaction,
+  key: Buffer,
+  branding: Branding,
+): Promise<CachedIdentity> {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 3072,
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  });
+  const generated = createSelfSignedSealIdentity({
+    commonName: `${branding.organizationName ?? branding.productName} document seal`,
+    organization: branding.organizationName,
+    privateKeyPem: privateKey,
+    publicKeyPem: publicKey,
+  });
+  const now = Math.floor(Date.now() / 1000);
+  const id = randomUUID();
+
+  await tx.query(
+    `UPDATE seal_keys SET retired_at = $1 WHERE retired_at IS NULL`,
+    [now],
+  );
+  await tx.query(
+    `
+      INSERT INTO seal_keys (id, certificate_pem, encrypted_private_key, created_at)
+      VALUES ($1, $2, $3, $4)
+    `,
+    [id, generated.certificatePem, encryptPrivateKey(privateKey, key), now],
+  );
+
+  return { identity: generated, source: `database:${id}` };
+}
+
+/**
+ * Notes in the site's audit trail that the stored key cannot be read. Once
+ * per key: every sealing fails until it is settled, and the trail does not
+ * need a row for each.
+ */
+async function noteUnreadableSealKey(sealKeyId: string, database: DbPool) {
+  try {
+    await withTransaction(async (tx) => {
+      // The site's trail is written under this same lock, so two instances
+      // cannot both find the note missing.
+      await tx.query("SELECT pg_advisory_xact_lock($1)", [SEAL_KEY_LOCK_ID]);
+
+      const noted = await tx.query(
+        `
+          SELECT 1 FROM system_audit_events
+          WHERE event = 'seal_key_unreadable'
+            AND metadata->>'sealKeyId' = $1
+          LIMIT 1
+        `,
+        [sealKeyId],
+      );
+
+      if (noted.rowCount === 0) {
+        await recordSystemAuditEvent(
+          {
+            actorType: "system",
+            event: "seal_key_unreadable",
+            metadata: { sealKeyId },
+          },
+          tx,
+        );
+      }
+    }, database);
+  } catch (error) {
+    console.error(
+      "[seal] Could not note the unreadable seal key in the audit trail:",
+      error,
+    );
+  }
+}
+
 async function identityFromDatabase(
   env: EnvSource,
   database: DbPool,
@@ -150,69 +267,123 @@ async function identityFromDatabase(
   // which a full pool could not give while this one waits on the lock.
   const branding = await getBranding(env);
 
-  return withTransaction(async (tx) => {
-    // One instance makes the key; any other waits here and then reads it.
-    await tx.query("SELECT pg_advisory_xact_lock($1)", [SEAL_KEY_LOCK_ID]);
+  const resolved = await withTransaction(async (tx) => {
+    const row = await readActiveSealKey(tx);
 
-    const existing = await tx.query<SealKeyRow>(
-      `
-        SELECT
-          id,
-          certificate_pem AS "certificatePem",
-          encrypted_private_key AS "encryptedPrivateKey"
-        FROM seal_keys
-        WHERE retired_at IS NULL
-        LIMIT 1
-      `,
+    if (!row) {
+      return storeNewSealKey(tx, key, branding);
+    }
+
+    const privateKeyPem = decryptPrivateKey(row.encryptedPrivateKey, key);
+
+    if (!privateKeyPem) {
+      return { unreadableSealKeyId: row.id };
+    }
+
+    return {
+      identity: {
+        certificateChainPem: [row.certificatePem],
+        privateKeyPem,
+      },
+      source: `database:${row.id}`,
+    };
+  }, database);
+
+  if ("unreadableSealKeyId" in resolved) {
+    console.error(`[seal] ${SEAL_KEY_UNREADABLE_MESSAGE}`);
+    await noteUnreadableSealKey(resolved.unreadableSealKeyId, database);
+
+    throw new SealKeyError(SEAL_KEY_UNREADABLE_MESSAGE);
+  }
+
+  return resolved;
+}
+
+export type SealKeyStatus = "environment" | "none" | "ok" | "unreadable";
+
+/** Where the seal key stands, for the administrator's settings page. */
+export async function getSealKeyStatus({
+  database = getDb(),
+  env = process.env,
+}: { database?: DbPool; env?: EnvSource } = {}): Promise<SealKeyStatus> {
+  if (readEnv(env, "SEAL_P12_BASE64")) {
+    return "environment";
+  }
+
+  const key = encryptionKey(env);
+  const stored = await database.query<{ encryptedPrivateKey: string }>(
+    `
+      SELECT encrypted_private_key AS "encryptedPrivateKey"
+      FROM seal_keys
+      WHERE retired_at IS NULL
+      LIMIT 1
+    `,
+  );
+  const row = stored.rows[0];
+
+  if (!row) {
+    return "none";
+  }
+
+  return decryptPrivateKey(row.encryptedPrivateKey, key) ? "ok" : "unreadable";
+}
+
+/**
+ * Makes a new seal key in place of a stored one that can no longer be read,
+ * which only an administrator decides. The old key is retired, not deleted,
+ * and the change is written to the site's audit trail with who made it.
+ */
+export async function replaceUnreadableSealKey(
+  actor: {
+    email: string;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+    userId: string;
+  },
+  {
+    database = getDb(),
+    env = process.env,
+  }: { database?: DbPool; env?: EnvSource } = {},
+): Promise<void> {
+  if (readEnv(env, "SEAL_P12_BASE64")) {
+    throw new SealKeyError(
+      "This site seals with the certificate in SEAL_P12_BASE64, so it has no key of its own to replace.",
+      409,
     );
-    const row = existing.rows[0];
+  }
 
-    if (row) {
-      const privateKeyPem = decryptPrivateKey(row.encryptedPrivateKey, key);
+  const key = encryptionKey(env);
+  const branding = await getBranding(env);
 
-      if (privateKeyPem) {
-        return {
-          identity: {
-            certificateChainPem: [row.certificatePem],
-            privateKeyPem,
-          },
-          source: `database:${row.id}`,
-        };
-      }
+  await withTransaction(async (tx) => {
+    const row = await readActiveSealKey(tx);
 
-      console.warn(
-        "[seal] The stored seal key cannot be read with the current auth secret; making a new one.",
+    if (!row || decryptPrivateKey(row.encryptedPrivateKey, key)) {
+      throw new SealKeyError(
+        "The sealing key can be read, so there is nothing to replace.",
+        409,
       );
     }
 
-    const { privateKey, publicKey } = generateKeyPairSync("rsa", {
-      modulusLength: 3072,
-      privateKeyEncoding: { format: "pem", type: "pkcs8" },
-      publicKeyEncoding: { format: "pem", type: "spki" },
-    });
-    const generated = createSelfSignedSealIdentity({
-      commonName: `${branding.organizationName ?? branding.productName} document seal`,
-      organization: branding.organizationName,
-      privateKeyPem: privateKey,
-      publicKeyPem: publicKey,
-    });
-    const now = Math.floor(Date.now() / 1000);
-    const id = randomUUID();
+    const made = await storeNewSealKey(tx, key, branding);
 
-    await tx.query(
-      `UPDATE seal_keys SET retired_at = $1 WHERE retired_at IS NULL`,
-      [now],
+    await recordSystemAuditEvent(
+      {
+        actorEmail: actor.email,
+        actorUserId: actor.userId,
+        event: "seal_key_replaced",
+        ipAddress: actor.ipAddress ?? null,
+        metadata: {
+          retiredSealKeyId: row.id,
+          sealKeyId: made.source.replace(/^database:/, ""),
+        },
+        userAgent: actor.userAgent ?? null,
+      },
+      tx,
     );
-    await tx.query(
-      `
-        INSERT INTO seal_keys (id, certificate_pem, encrypted_private_key, created_at)
-        VALUES ($1, $2, $3, $4)
-      `,
-      [id, generated.certificatePem, encryptPrivateKey(privateKey, key), now],
-    );
-
-    return { identity: generated, source: `database:${id}` };
   }, database);
+
+  resetSealIdentityCache();
 }
 
 export async function getSealIdentity({

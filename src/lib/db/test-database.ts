@@ -57,7 +57,15 @@ export async function openTestDatabase(): Promise<pg.Pool> {
   await ensureDatabaseExists(connectionString, name);
   await runMigrations({ connectionString, log: () => undefined });
 
-  return new pg.Pool({ connectionString, max: 12 });
+  const pool = new pg.Pool({ connectionString, max: 12 });
+
+  // The seal key is stored under the auth secret, and the test files (and
+  // the end-to-end test, on this same database) do not all use the same
+  // one. A key left by another would stop sealing, so each file starts
+  // without one and makes its own.
+  await pool.query("delete from public.seal_keys");
+
+  return pool;
 }
 
 /**

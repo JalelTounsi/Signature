@@ -70,7 +70,9 @@ To clear it, make the database's values write-only. This stays inside Vercel:
 4. While you are in the project, add a `BETTER_AUTH_SECRET` environment variable (Production, as a Secret) with a value from `openssl rand -hex 32`, so later password changes leave sign-ins alone.
 5. Open **Deployments** and redeploy the latest production deployment.
 
-Do this right after the deploy, before people use the site. Unless `BETTER_AUTH_SECRET` was already set, the site's own secret comes from the database password, so step 3 (and step 4) changes it: everyone is signed out, the site makes a new key for sealing documents (PDFs sealed before still verify, under the old certificate), and anyone in the middle of signing with an outside signing provider has to start that step again.
+Do this right after the deploy, before people use the site. Unless `BETTER_AUTH_SECRET` was already set, the site's own secret comes from the database password, so step 3 (and step 4) changes it: everyone is signed out, the key the site seals documents with can no longer be read, and anyone in the middle of signing with an outside signing provider has to start that step again.
+
+The site never replaces its sealing key by itself. If it had already sealed a document before the secret changed, sealing stops: an envelope cannot be finished, and the site's audit trail (Settings, Security) records that the key cannot be read. Sign in as the administrator, open Settings and press **Make a new sealing key**. PDFs sealed before still verify, under the old certificate, and the change is recorded in the audit trail. Putting the earlier secret back instead makes the old key work again. A site that had not sealed anything yet makes its first key the first time it does, and needs nothing from you.
 
 After this, preview deployments have no database and open on the page that asks you to connect one. That only matters if you build changes on branches before putting them live.
 
@@ -242,7 +244,7 @@ Validating the install is up to your organization. The [Part 11 validation pack]
 
 Every finished PDF and audit certificate is sealed with a PAdES signature, so any change after signing shows in Adobe Acrobat and other PDF readers, and its SHA-256 is recorded. Anyone can check a copy at `/verify`. The audit trail in the database is a hash chain, so an edited or deleted row shows too.
 
-By default each install makes its own seal key and self-signed certificate the first time it seals, and keeps the key encrypted in the database with a key derived from `BETTER_AUTH_SECRET` (or the database password, when that is unset). Keep that secret stable: a new one makes a new seal key, and old PDFs still verify but under the old certificate. Readers show a self-signed seal as "validity unknown" until the certificate is trusted. For a seal readers trust on sight, buy a document-signing certificate and set `SEAL_P12_BASE64` and `SEAL_P12_PASSWORD`. `SEAL_TIMESTAMP_URL` adds a trusted time from a timestamp server.
+By default each install makes its own seal key and self-signed certificate the first time it seals, and keeps the key encrypted in the database with a key derived from `BETTER_AUTH_SECRET` (or the database password, when that is unset). Keep that secret stable: under a new one the stored key cannot be read, and sealing stops until the earlier secret is put back or an administrator makes a new key in Settings (old PDFs still verify, under the old certificate). Readers show a self-signed seal as "validity unknown" until the certificate is trusted. For a seal readers trust on sight, buy a document-signing certificate and set `SEAL_P12_BASE64` and `SEAL_P12_PASSWORD`. `SEAL_TIMESTAMP_URL` adds a trusted time from a timestamp server.
 
 ### Long-term validation
 

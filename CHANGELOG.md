@@ -18,6 +18,14 @@ Four fixes to how 0.9.0 keeps its records. This changes the database: run
   stays, and a `send_reverted` or `reminder_reverted` event is added after
   it, so an audit trail never loses a row. The envelope page, the audit
   export and the certificate show the new events.
+- The site no longer makes a new sealing key by itself when
+  `BETTER_AUTH_SECRET` (or the database password it is derived from)
+  changes. Sealing stops with an error that says why, the site's audit
+  trail records it once, and an administrator makes the new key in Settings,
+  which is recorded too. Putting the earlier secret back makes the old key
+  work again. If you changed the secret after the site had sealed a
+  document, open Settings after this update: see
+  [docs/self-hosting.md](docs/self-hosting.md).
 
 ## [0.9.0] - 2026-11-22
 
