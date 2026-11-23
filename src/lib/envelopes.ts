@@ -600,6 +600,8 @@ const TIMELINE_TONE_MAP: Record<
   reminded_auto: "neutral",
   signer_corrected: "neutral",
   reminded_manual: "neutral",
+  reminder_reverted: "danger",
+  send_reverted: "danger",
   sent: "neutral",
   signed: "success",
   verification_failed: "danger",
@@ -1897,6 +1899,10 @@ function buildTimelineDescription(event: AuditEventRecord): string {
       return "Deadline passed before everyone signed";
     case "signer_corrected":
       return describeSignerCorrectedEvent(event.metadata);
+    case "send_reverted":
+      return "Sending undone: the invitation email could not be delivered";
+    case "reminder_reverted":
+      return `Reminder to ${targetLabel} undone: the email could not be delivered`;
     default:
       return event.event;
   }
@@ -3014,6 +3020,7 @@ export async function sendDraftEnvelope(
 
   const sentAt = Math.floor(Date.now() / 1000);
   const sentAuditAt = Math.max(sentAt, envelope.createdAt + 1);
+  let sentAuditEventId: string | null = null;
   const expiresAt = deadlineFromDays(sentAt, input.expiresInDays);
   const issuedLinks = new Map<string, IssuedSigningLink>();
 
@@ -3196,7 +3203,7 @@ export async function sendDraftEnvelope(
         }
       }
 
-      await recordAuditEvent(
+      const sentEvent = await recordAuditEvent(
         {
           actorEmail: input.senderEmail,
           actorType: "sender",
@@ -3237,6 +3244,8 @@ export async function sendDraftEnvelope(
         },
         tx,
       );
+
+      sentAuditEventId = sentEvent.id;
     }, database);
   } catch (error) {
     throw error;
@@ -3339,22 +3348,19 @@ export async function sendDraftEnvelope(
         [envelope.updatedAt, envelopeId],
       );
 
-      await lockEnvelopeAuditChain(envelopeId, tx);
-      await tx.query(
-        `
-          DELETE FROM audit_events
-          WHERE envelope_id = $1
-            AND event = 'sent'
-            AND created_at = $2
-            AND actor_email = $3
-            -- Only while it is still the newest link of the audit chain: an
-            -- event recorded after it (say, the invitation was opened before
-            -- the send failed) chains to it, so it stays as history.
-            AND sequence = (
-              SELECT max(sequence) FROM audit_events WHERE envelope_id = $1
-            )
-        `,
-        [envelopeId, sentAuditAt, input.senderEmail],
+      // The sent event stays where it is in the chain. What undid it is
+      // recorded after it, so the trail never loses a row.
+      await recordAuditEvent(
+        {
+          actorType: "system",
+          envelopeId,
+          event: "send_reverted",
+          metadata: {
+            reason: "invitation_email_failed",
+            revertedEventId: sentAuditEventId,
+          },
+        },
+        tx,
       );
       // The envelope.sent webhook was held for the invitation (see
       // releaseSentWebhook below); it did not go out, so there is nothing

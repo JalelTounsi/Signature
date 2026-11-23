@@ -253,7 +253,36 @@ test("a reminder whose email fails leaves the signer's link as it was", async ()
   assert.equal(signer.signing_token_hash, due.tokenHash);
   assert.equal(signer.last_nudged_at, null);
   assert.equal(signer.last_notified_at, SENT_AT);
-  assert.deepEqual(await auditEvents(due.envelopeId), []);
+  // The reminder was recorded, then the email failed. The record stays and
+  // the reversal is added after it: the chain never loses a row.
+  assert.deepEqual(await auditEvents(due.envelopeId), [
+    "reminded_auto",
+    "reminder_reverted",
+  ]);
+  assert.deepEqual(await verifyAuditChain(due.envelopeId, database), {
+    chainedEvents: 2,
+    ok: true,
+  });
+
+  const reversal = await database.query<{
+    metadata: Record<string, unknown>;
+    reminder: string;
+  }>(
+    `
+      select metadata,
+        (select id from audit_events
+          where envelope_id = $1 and event = 'reminded_auto') as reminder
+      from audit_events
+      where envelope_id = $1 and event = 'reminder_reverted'
+    `,
+    [due.envelopeId],
+  );
+
+  assert.equal(
+    reversal.rows[0]?.metadata.revertedEventId,
+    reversal.rows[0]?.reminder,
+  );
+  assert.equal(reversal.rows[0]?.metadata.signerId, due.signerId);
 
   // So the next run tries again.
   const working = recordingEmailService();

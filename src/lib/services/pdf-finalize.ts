@@ -1498,6 +1498,18 @@ function describeEventEvidence(event: AuditEventRecord): string[] {
     details.push(describeSignerCorrectedEvent(metadata));
   }
 
+  if (event.event === "send_reverted") {
+    details.push(
+      "the invitation email could not be delivered, so the envelope went back to being a draft",
+    );
+  }
+
+  if (event.event === "reminder_reverted") {
+    details.push(
+      "the reminder email could not be delivered, so the signer kept the link they already had",
+    );
+  }
+
   if (event.event === "verified" && typeof metadata.method === "string") {
     details.push(
       `passed: ${AUTHENTICATION_LABELS[metadata.method] ?? metadata.method}`,

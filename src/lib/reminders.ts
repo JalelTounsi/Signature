@@ -18,11 +18,7 @@ import {
 } from "./schemas/envelope.ts";
 import { type SignerRecord } from "./schemas/signer.ts";
 import { getBranding } from "./settings.ts";
-import {
-  lockEnvelopeAuditChain,
-  recordAuditEvent,
-  recordEmailSent,
-} from "./services/audit.ts";
+import { recordAuditEvent, recordEmailSent } from "./services/audit.ts";
 import {
   createEmailService,
   EMAIL_NOT_CONNECTED_MESSAGE,
@@ -639,20 +635,22 @@ async function deliverReminder(
         ],
       );
 
-      await lockEnvelopeAuditChain(persisted.envelopeId, tx);
-      await tx.query(
-        `
-          DELETE FROM audit_events
-          WHERE envelope_id = $1
-            AND id = $2
-            -- Only while it is still the newest link of the audit chain: an
-            -- event recorded after it (say, the invitation was opened before
-            -- the send failed) chains to it, so it stays as history.
-            AND sequence = (
-              SELECT max(sequence) FROM audit_events WHERE envelope_id = $1
-            )
-        `,
-        [persisted.envelopeId, persisted.auditEventId],
+      // The reminder event stays where it is in the chain. What undid it
+      // is recorded after it, so the trail never loses a row.
+      await recordAuditEvent(
+        {
+          actorType: "system",
+          envelopeId: persisted.envelopeId,
+          event: "reminder_reverted",
+          metadata: {
+            reason: "reminder_email_failed",
+            revertedEventId: persisted.auditEventId,
+            signerEmail: persisted.signerEmail,
+            signerId: persisted.signerId,
+            signerName: persisted.signerName,
+          },
+        },
+        tx,
       );
     }, database).catch((rollbackError) => {
       console.error(

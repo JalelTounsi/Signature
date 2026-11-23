@@ -11,6 +11,7 @@ import type pg from "pg";
 import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import { ELECTRONIC_RECORDS_DISCLOSURE_VERSION } from "./electronic-records-disclosure.ts";
 import { sendDraftEnvelope, voidSentEnvelope } from "./envelopes.ts";
+import { verifyAuditChain } from "./services/audit.ts";
 import { issueSigningLink } from "./services/signing-links.ts";
 import {
   createStorageService,
@@ -360,4 +361,74 @@ test("an envelope voided while its invitation fails to send stays voided, link a
   // them, so their invitation still says it was voided.
   assert.equal(signer.rows[0]?.status, "notified");
   assert.ok(signer.rows[0]?.spent);
+});
+
+test("a send whose invitation fails keeps its place in the audit trail", async () => {
+  const envelope = await createSentEnvelope();
+  const outbox = path.join(storageDir, "outbox");
+
+  // Back to a draft with one signer waiting, ready to send.
+  await database.query(
+    `update envelopes set status = 'draft', sent_at = null, expires_at = null where id = $1`,
+    [envelope.envelopeId],
+  );
+  await database.query(
+    `
+      update signers
+      set status = 'pending', signing_token_hash = null,
+        signing_token_expires_at = null, last_notified_at = null,
+        consented_at = null
+      where envelope_id = $1
+    `,
+    [envelope.envelopeId],
+  );
+
+  try {
+    // The invitation cannot be delivered: a file stands where the captured
+    // emails go.
+    await rm(outbox, { force: true, recursive: true });
+    await writeFile(outbox, "");
+
+    await assert.rejects(
+      sendDraftEnvelope(
+        envelope.userId,
+        envelope.envelopeId,
+        { senderEmail: "sam@example.test", senderName: "Sam Sender" },
+        { database },
+      ),
+    );
+  } finally {
+    await rm(outbox, { force: true, recursive: true });
+  }
+
+  assert.equal(await envelopeStatus(envelope.envelopeId), "draft");
+
+  const trail = await database.query<{
+    event: string;
+    id: string;
+    metadata: Record<string, unknown> | null;
+  }>(
+    `select id, event, metadata from audit_events where envelope_id = $1 order by sequence`,
+    [envelope.envelopeId],
+  );
+
+  // The send happened and was undone. Both stay on record, after the
+  // consent the helper left: nothing is taken out of the chain.
+  assert.deepEqual(
+    trail.rows.map((row) => row.event),
+    ["consented", "sent", "send_reverted"],
+  );
+  assert.equal(trail.rows[2]?.metadata?.revertedEventId, trail.rows[1]?.id);
+  assert.deepEqual(await verifyAuditChain(envelope.envelopeId, database), {
+    chainedEvents: 3,
+    ok: true,
+  });
+
+  // No envelope.sent webhook is left waiting for a send that was undone.
+  const held = await database.query(
+    `select 1 from webhook_deliveries where envelope_id = $1`,
+    [envelope.envelopeId],
+  );
+
+  assert.equal(held.rowCount, 0);
 });

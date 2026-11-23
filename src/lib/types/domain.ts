@@ -87,6 +87,8 @@ export const auditEventTypes = [
   "signer_corrected",
   "approved",
   "rejected",
+  "send_reverted",
+  "reminder_reverted",
 ] as const;
 
 /**

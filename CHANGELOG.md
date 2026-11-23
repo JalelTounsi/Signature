@@ -8,6 +8,17 @@ release says when it does.
 
 ## [Unreleased]
 
+Four fixes to how 0.9.0 keeps its records. This changes the database: run
+`npm run db:migrate` (a Vercel deploy does it during the build).
+
+### Fixed
+
+- A send or a reminder whose email fails is still undone, but its audit
+  event is no longer deleted from the envelope's hash chain. The event
+  stays, and a `send_reverted` or `reminder_reverted` event is added after
+  it, so an audit trail never loses a row. The envelope page, the audit
+  export and the certificate show the new events.
+
 ## [0.9.0] - 2026-11-22
 
 People can now work as a team, seeing the envelopes their teammates send,
