@@ -30,6 +30,13 @@ Four fixes to how 0.9.0 keeps its records. This changes the database: run
   and refuses to run, naming the file, when an applied migration has been
   edited since. An existing database gets its checksums on the first run
   and is not refused.
+- Deleting a closed account no longer deletes its envelopes that are still
+  out for signature. They are voided first, as a sender voids one: the
+  audit trail records it with the reason, the signers are told, and their
+  links say the envelope was voided. On a self-hosted install the voided
+  envelopes then move to an administrator with the account's other
+  finished records. An account is never deleted while one of its envelopes
+  is still out; the daily cleanup tries again the next day.
 
 ## [0.9.0] - 2026-11-22
 

@@ -10,6 +10,11 @@ import type pg from "pg";
 import { createApiKey } from "./api-keys.ts";
 import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import { runRetentionSweep } from "./retention.ts";
+import { verifyAuditChain } from "./services/audit.ts";
+import type {
+  EmailService,
+  TransactionalEmailMessage,
+} from "./services/email.ts";
 import {
   createStorageService,
   type StorageService,
@@ -28,6 +33,9 @@ const createdUsers: string[] = [];
 
 before(async () => {
   database = await openTestDatabase();
+  // The seal on a void's certificate and the name in its notice come from
+  // the install's settings, read through the shared pool.
+  globalThis.__signudocPgPool = database;
   storageDir = await mkdtemp(path.join(tmpdir(), "signudoc-purge-"));
   storageService = createStorageService({
     env: { STORAGE_DRIVER: "local", STORAGE_LOCAL_DIR: storageDir },
@@ -104,6 +112,16 @@ function complete(envelopeId: string) {
   );
 }
 
+/**
+ * The deletion's look for envelopes still out for signature, which it voids
+ * before anything else. What a test does right after it happens between
+ * that look and the deletion taking hold of the account.
+ */
+function isLookForOpenEnvelopes(userId: string) {
+  return (text: string, values: unknown[]) =>
+    text.includes("AND e.status = 'sent'") && values[0] === userId;
+}
+
 /** Resolves once another session is held up behind a lock. */
 async function waitForLockWaiter() {
   for (let attempt = 0; attempt < 300; attempt += 1) {
@@ -149,25 +167,27 @@ test("an envelope completed while its sender's account is being deleted goes to 
   await createUser("admin");
 
   const leaver = await createUser();
-  const envelope = await createSentEnvelope(leaver);
+  let sent: Awaited<ReturnType<typeof createSentEnvelope>> | undefined;
 
   await closeAccount(leaver);
 
-  // The last signature lands just after the deletion has taken hold of the
+  // An envelope goes out and its last signature lands just after the
+  // deletion has looked for envelopes to void, before it takes hold of the
   // account.
   const summary = await runRetentionSweep({
     database: afterStatement(
       database,
-      (text, values) =>
-        text.includes(`FROM "user" WHERE id = $1 FOR UPDATE`) &&
-        values[0] === leaver,
+      isLookForOpenEnvelopes(leaver),
       async () => {
-        assert.equal((await complete(envelope.id)).rowCount, 1);
+        sent = await createSentEnvelope(leaver);
+        assert.equal((await complete(sent.id)).rowCount, 1);
       },
     ),
     storageService,
   });
+  const envelope = sent;
 
+  assert.ok(envelope, "the deletion never looked for open envelopes");
   assert.ok(!summary.accountPurgeFailures.includes(leaver));
   assert.equal(await accountExists(leaver), false);
 
@@ -192,51 +212,52 @@ test("an envelope completed while its sender's account is being deleted goes to 
   );
 });
 
-test("once the finished envelopes are handed over, no other envelope of the account can be completed", async () => {
+test("an envelope sent while the deletion starts keeps its account, and is voided by the next run", async () => {
   await createUser("admin");
 
   const leaver = await createUser();
-  const envelope = await createSentEnvelope(leaver);
-  let signature: Promise<pg.QueryResult> | undefined;
+  let sent: Awaited<ReturnType<typeof createSentEnvelope>> | undefined;
 
   await closeAccount(leaver);
 
-  // The last signature arrives right after the deletion has looked for
-  // finished envelopes and found none. It has to wait for the deletion.
-  const summary = await runRetentionSweep({
+  // The envelope goes out right after the deletion has looked for
+  // envelopes to void and found none.
+  const first = await runRetentionSweep({
     database: afterStatement(
       database,
-      (text, values) =>
-        text.includes("SELECT count(*)::text AS count") &&
-        text.includes("FROM envelopes") &&
-        values[0] === leaver,
+      isLookForOpenEnvelopes(leaver),
       async () => {
-        signature = complete(envelope.id);
-        await Promise.race([
-          signature.then(
-            () => undefined,
-            () => undefined,
-          ),
-          waitForLockWaiter(),
-        ]);
+        sent ??= await createSentEnvelope(leaver);
       },
     ),
+    emailService: recordingEmailService().service,
+    storageService,
+  });
+  const envelope = sent;
+
+  assert.ok(envelope, "the deletion never looked for open envelopes");
+
+  // It is never deleted with the account: the account waits.
+  assert.ok(first.accountPurgeFailures.includes(leaver));
+  assert.equal(await accountExists(leaver), true);
+  assert.equal((await envelopeRow(envelope.id))?.status, "sent");
+
+  const second = await runRetentionSweep({
+    database,
+    emailService: recordingEmailService().service,
     storageService,
   });
 
-  assert.ok(signature, "the deletion never looked for finished envelopes");
-  assert.ok(!summary.accountPurgeFailures.includes(leaver));
+  assert.ok(!second.accountPurgeFailures.includes(leaver));
   assert.equal(await accountExists(leaver), false);
 
-  // It found no envelope left to complete. Had it completed one, that
-  // record would have to be here still.
-  const completed = (await signature).rowCount === 1;
+  const kept = await envelopeRow(envelope.id);
 
-  assert.equal(completed, false);
-  assert.equal(await envelopeRow(envelope.id), null);
+  assert.equal(kept?.status, "voided");
+  assert.notEqual(kept?.user_id, leaver);
   assert.equal(
     (await storageService.headObject(envelope.sourcePdfKey)).exists,
-    false,
+    true,
   );
 });
 
@@ -248,22 +269,24 @@ test("with no administrator to take it, an envelope completed during the deletio
 
   try {
     const leaver = await createUser();
-    const envelope = await createSentEnvelope(leaver);
+    let sent: Awaited<ReturnType<typeof createSentEnvelope>> | undefined;
 
     await closeAccount(leaver);
 
     const summary = await runRetentionSweep({
       database: afterStatement(
         database,
-        (text, values) =>
-          text.includes(`FROM "user" WHERE id = $1 FOR UPDATE`) &&
-          values[0] === leaver,
+        isLookForOpenEnvelopes(leaver),
         async () => {
-          assert.equal((await complete(envelope.id)).rowCount, 1);
+          sent = await createSentEnvelope(leaver);
+          assert.equal((await complete(sent.id)).rowCount, 1);
         },
       ),
       storageService,
     });
+    const envelope = sent;
+
+    assert.ok(envelope, "the deletion never looked for open envelopes");
 
     // Nothing is deleted. The next run tries again.
     assert.ok(summary.accountPurgeFailures.includes(leaver));
@@ -376,4 +399,103 @@ test("the daily job's account deletion is logged as the system's, not a person's
   assert.equal(deletion.actorType, "system");
   assert.equal(deletion.actorUserId, null);
   assert.equal(deletion.actorEmail, null);
+});
+
+/** A signer of this envelope whose turn it is, holding a link. */
+async function addWaitingSigner(envelopeId: string) {
+  const id = randomUUID();
+  const tokenHash = randomUUID().replaceAll("-", "").repeat(2);
+
+  await database.query(
+    `
+      insert into signers (
+        id, envelope_id, name, email, sign_order, status,
+        signing_token_hash, signing_token_expires_at, last_notified_at
+      ) values ($1, $2, 'Riley Recipient', $3, 1, 'notified', $4, $5, 1)
+    `,
+    [id, envelopeId, `${id}@example.test`, tokenHash, 4_000_000_000],
+  );
+
+  return { email: `${id}@example.test`, id };
+}
+
+function recordingEmailService() {
+  const sent: TransactionalEmailMessage[] = [];
+  const service: EmailService = {
+    async send(message) {
+      sent.push(message);
+
+      return { accepted: [message.to], messageId: "m-1", rejected: [] };
+    },
+    async sendBatch() {
+      throw new Error("not used");
+    },
+  };
+
+  return { sent, service };
+}
+
+test("an envelope still out for signature is voided, not deleted, when its sender's account is deleted", async () => {
+  await createUser("admin");
+
+  const leaver = await createUser();
+  const envelope = await createSentEnvelope(leaver);
+  const signer = await addWaitingSigner(envelope.id);
+  const emails = recordingEmailService();
+
+  await closeAccount(leaver);
+
+  const summary = await runRetentionSweep({
+    database,
+    emailService: emails.service,
+    storageService,
+  });
+
+  assert.ok(!summary.accountPurgeFailures.includes(leaver));
+  assert.equal(await accountExists(leaver), false);
+
+  // The envelope outlives the account as a voided record, with its trail,
+  // in an administrator's keeping.
+  const kept = await envelopeRow(envelope.id);
+
+  assert.ok(
+    kept,
+    "the envelope out for signature was deleted with the account",
+  );
+  assert.equal(kept.status, "voided");
+  assert.notEqual(kept.user_id, leaver);
+  assert.ok(kept.handed_over_at);
+  assert.equal(
+    (await storageService.headObject(envelope.sourcePdfKey)).exists,
+    true,
+  );
+
+  const voided = await database.query<{
+    actor_type: string;
+    metadata: Record<string, unknown> | null;
+  }>(
+    `select actor_type, metadata from audit_events where envelope_id = $1 and event = 'voided'`,
+    [envelope.id],
+  );
+
+  assert.equal(voided.rows.length, 1);
+  assert.equal(voided.rows[0]?.actor_type, "system");
+  assert.match(String(voided.rows[0]?.metadata?.reason), /account was closed/);
+  assert.equal((await verifyAuditChain(envelope.id, database)).ok, true);
+
+  // The signer's link is retired and they are told why.
+  const link = await database.query<{
+    signing_token_hash: string | null;
+    spent_signing_token_hash: string | null;
+  }>(
+    `select signing_token_hash, spent_signing_token_hash from signers where id = $1`,
+    [signer.id],
+  );
+
+  assert.equal(link.rows[0]?.signing_token_hash, null);
+  assert.ok(link.rows[0]?.spent_signing_token_hash);
+  assert.deepEqual(
+    emails.sent.map((message) => message.to),
+    [signer.email],
+  );
 });

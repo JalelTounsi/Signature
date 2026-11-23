@@ -5,6 +5,7 @@ import {
   queryOne,
   withTransaction,
 } from "./db/connection.ts";
+import { EnvelopeMutationError, voidSentEnvelope } from "./envelopes.ts";
 import { findRecordKeeper } from "./people.ts";
 import {
   buildEnvelopeThumbnailKey,
@@ -529,6 +530,78 @@ async function handOverFinishedEnvelopes(
   return false;
 }
 
+/** What the audit trail and the signers are told when this voids an envelope. */
+const ACCOUNT_CLOSED_VOID_REASON = "The sender's account was closed.";
+
+/**
+ * Voids the envelopes of a closing account that are still out for
+ * signature, before the account is deleted. They would otherwise be deleted
+ * with it: their signers would hold links that open nothing, with no word
+ * of why, and the audit trail would be gone. Each is voided as a sender
+ * voids one (certificate, audit event, notice to the signers), so on a
+ * self-hosted install it is then a finished record that goes to an
+ * administrator. A Part 11 envelope there is handed over as it is, still
+ * out for signature, and is left alone.
+ */
+async function voidOpenEnvelopes(
+  userId: string,
+  keepFinishedEnvelopes: boolean,
+  database: ReturnType<typeof getDb>,
+  storageService: StorageService,
+  emailService: EmailService | undefined,
+): Promise<void> {
+  const open = await queryMany<{
+    id: string;
+    ownerEmail: string;
+    ownerName: string | null;
+  }>(
+    database,
+    `
+      SELECT e.id, u.email AS "ownerEmail", u.name AS "ownerName"
+      FROM envelopes e
+      JOIN "user" u ON u.id = e.user_id
+      WHERE e.user_id = $1
+        AND e.status = 'sent'
+        AND NOT (e.part11 AND $2::boolean)
+      ORDER BY e.id
+    `,
+    [userId, keepFinishedEnvelopes],
+  );
+
+  for (const envelope of open) {
+    try {
+      await voidSentEnvelope(
+        userId,
+        envelope.id,
+        {
+          actorType: "system",
+          reason: ACCOUNT_CLOSED_VOID_REASON,
+          senderEmail: envelope.ownerEmail,
+          senderName: envelope.ownerName?.trim() || envelope.ownerEmail,
+        },
+        { database, emailService, storageService },
+      );
+    } catch (error) {
+      // Signed, declined or voided in the meantime: it is finished, which
+      // is all this is for. One that is still out stops the purge below.
+      if (error instanceof EnvelopeMutationError && error.statusCode === 409) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+}
+
+export class AccountPurgeOpenEnvelopesError extends Error {
+  constructor(userId: string) {
+    super(
+      `Account ${userId} still has envelopes out for signature. Its purge is deferred until they are voided, which the next run tries again.`,
+    );
+    this.name = "AccountPurgeOpenEnvelopesError";
+  }
+}
+
 export class AccountPurgeDeferredError extends Error {
   constructor(userId: string) {
     super(
@@ -573,26 +646,41 @@ async function deleteAccountRows(
     return null;
   }
 
-  if (keepFinishedEnvelopes) {
-    // The account's envelopes are locked before the finished ones are
-    // handed over, and stay locked until the account is gone. Signing,
-    // declining and voiding all change the envelope's row, so one that got
-    // in first has finished and its envelope is handed over here, and one
-    // that comes after waits and then finds no envelope. Without the lock
-    // an envelope could be completed between the hand-over and the delete,
-    // and its signed record would go with the account.
-    //
-    // The lock an UPDATE takes, not FOR UPDATE: a signer's audit event
-    // needs a share of this row for its foreign key, and FOR UPDATE would
-    // make it wait.
-    await database.query(
-      `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
-      [userId],
-    );
+  // The account's envelopes are locked before the finished ones are
+  // handed over, and stay locked until the account is gone. Signing,
+  // declining and voiding all change the envelope's row, so one that got
+  // in first has finished and its envelope is handed over here, and one
+  // that comes after waits and then finds no envelope. Without the lock
+  // an envelope could be completed between the hand-over and the delete,
+  // and its signed record would go with the account.
+  //
+  // The lock an UPDATE takes, not FOR UPDATE: a signer's audit event
+  // needs a share of this row for its foreign key, and FOR UPDATE would
+  // make it wait.
+  await database.query(
+    `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
+    [userId],
+  );
 
-    if (!(await handOverFinishedEnvelopes(userId, now, database))) {
-      throw new AccountPurgeDeferredError(userId);
-    }
+  if (
+    keepFinishedEnvelopes &&
+    !(await handOverFinishedEnvelopes(userId, now, database))
+  ) {
+    throw new AccountPurgeDeferredError(userId);
+  }
+
+  // Envelopes out for signature were voided before this began (see
+  // voidOpenEnvelopes). One that is still out, because it was sent since or
+  // its void failed, is never deleted with the account: the account waits
+  // for the next run.
+  const stillOut = await queryOne<{ id: string }>(
+    database,
+    `SELECT id FROM envelopes WHERE user_id = $1 AND status = 'sent' LIMIT 1`,
+    [userId],
+  );
+
+  if (stillOut) {
+    throw new AccountPurgeOpenEnvelopesError(userId);
   }
 
   const envelopes = await listEnvelopeArtifactsForUser(userId, database);
@@ -674,11 +762,26 @@ async function purgeQueuedAccount(
   now: number,
   database: DbExecutor,
   storageService: StorageService,
+  emailService?: EmailService,
   env: EnvSource = process.env,
 ): Promise<boolean> {
   // On a self-hosted install the finished envelopes stay with the
   // organization. Hosted mode keeps nothing of a closed account.
   const keepFinishedEnvelopes = !isHostedMode(env);
+
+  // Each void is a transaction of its own, with files and emails, so it
+  // comes before the one that deletes the account. A caller with its own
+  // connection has none to spare for that; the check in deleteAccountRows
+  // then keeps the account while an envelope is out.
+  if (isPool(database)) {
+    await voidOpenEnvelopes(
+      userId,
+      keepFinishedEnvelopes,
+      database,
+      storageService,
+      emailService,
+    );
+  }
 
   // One transaction, so the locks on the account and its envelopes hold
   // from the hand-over and the list of its files to the delete. A caller
@@ -1267,6 +1370,7 @@ export async function runRetentionSweep({
         now,
         database,
         storageService,
+        emailService,
       );
 
       if (deleted) {

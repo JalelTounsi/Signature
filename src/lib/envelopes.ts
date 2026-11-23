@@ -183,6 +183,11 @@ type SendDraftEnvelopeInput = {
 };
 
 type VoidEnvelopeInput = {
+  /**
+   * "system" when the install ends the envelope itself, as it does when the
+   * sender's account is deleted. Left out, the sender voided it.
+   */
+  actorType?: "sender" | "system";
   ipAddress?: string | null;
   /** Why it is voided. Required for a Part 11 envelope. */
   reason?: string | null;
@@ -225,6 +230,8 @@ export const draftRecipientsChangedMessage =
 
 type VoidEnvelopeOptions = {
   database?: DbPool;
+  emailService?: EmailService;
+  storageService?: StorageService;
 };
 
 type EnvelopeRow = {
@@ -1886,6 +1893,14 @@ function buildTimelineDescription(event: AuditEventRecord): string {
     case "completed":
       return "Final signed PDF and certificate generated";
     case "voided":
+      // The install voids an envelope itself when its sender's account is
+      // deleted.
+      if (event.actorType === "system") {
+        return declineReason
+          ? `Envelope voided — ${declineReason}`
+          : "Envelope voided";
+      }
+
       return declineReason
         ? `Envelope voided by sender — ${declineReason}`
         : "Envelope voided by sender";
@@ -3994,7 +4009,11 @@ async function voidSentEnvelopeOnce(
   userId: string,
   envelopeId: string,
   input: VoidEnvelopeInput,
-  { database = getDb() }: VoidEnvelopeOptions = {},
+  {
+    database = getDb(),
+    emailService: givenEmailService,
+    storageService: givenStorageService,
+  }: VoidEnvelopeOptions = {},
 ): Promise<VoidEnvelopeResult> {
   const envelope = await getEnvelopeByIdForUser(userId, envelopeId, database);
 
@@ -4027,8 +4046,8 @@ async function voidSentEnvelopeOnce(
     (signer) => signer.status === "notified" || signer.status === "signed",
   );
   const voidedAt = Math.floor(Date.now() / 1000);
-  const emailService = createEmailService();
-  const storageService = createStorageService();
+  const emailService = givenEmailService ?? createEmailService();
+  const storageService = givenStorageService ?? createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
 
   if (!sourcePdfHead.exists) {
@@ -4039,8 +4058,8 @@ async function voidSentEnvelopeOnce(
   }
 
   const voidedAuditEvent: AuditEventRecord = {
-    actorEmail: input.senderEmail,
-    actorType: "sender",
+    actorEmail: input.actorType === "system" ? null : input.senderEmail,
+    actorType: input.actorType ?? "sender",
     createdAt: voidedAt,
     envelopeId,
     event: "voided",
