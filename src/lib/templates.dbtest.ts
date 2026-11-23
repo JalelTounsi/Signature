@@ -20,6 +20,7 @@ import {
   replaceDraftEnvelopeSigners,
 } from "./envelopes.ts";
 import { runRetentionSweep } from "./retention.ts";
+import { importPdfDocument } from "./services/document-import.ts";
 import { buildTemplatePdfKey } from "./services/storage-keys.ts";
 import {
   createStorageService,
@@ -378,13 +379,19 @@ test("a draft made from a template has the fields on the people named for it", a
   );
   assert.deepEqual(await listTemplatesForUser(userId, database), []);
 
+  // What is stored is the import's rewrite of the upload, not the upload.
+  const stored = await importPdfDocument({
+    body: sourcePdf,
+    filename: "lease.pdf",
+  });
+
   for (const envelopeId of [made.envelopeId, originalId]) {
     const document = await getDraftEnvelopeDocumentForUser(userId, envelopeId, {
       database,
       storageService,
     });
 
-    assert.equal(document.body.length, sourcePdf.length);
+    assert.equal(document.body.length, stored.sizeBytes);
   }
 });
 

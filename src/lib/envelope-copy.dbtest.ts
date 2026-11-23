@@ -513,7 +513,7 @@ test("a completed envelope is copied into a new draft with people, fields and a 
   );
 
   assert.equal(sha256(copiedDocument.body), sha256(originalDocument.body));
-  assert.equal(copiedDocument.body.length, sourcePdf.length);
+  assert.equal(copiedDocument.body.length, originalDocument.body.length);
   assert.equal(
     draft.source_pdf_key,
     buildEnvelopeOriginalPdfKey({ envelopeId: copied.id, userId }),

@@ -650,8 +650,10 @@ export async function createDraftEnvelope(
     userId,
   });
 
+  // The import's rewrite of the upload is stored, never the upload itself:
+  // signers are shown this file and the signed copy is made from it.
   await storageService.putObject({
-    body: input.sourcePdf.body,
+    body: importedPdf.body,
     contentType: "application/pdf",
     key: sourcePdfKey,
   });

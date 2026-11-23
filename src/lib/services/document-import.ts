@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, PDFName } from "pdf-lib";
 
 import type { EnvelopePageRecord } from "../schemas/envelope.ts";
 import { MAX_PDF_PAGES, MAX_UPLOAD_SIZE_BYTES } from "../types/domain.ts";
@@ -43,6 +43,11 @@ export type ImportedPdfPage = Pick<
 >;
 
 export type ImportedPdfDocument = {
+  /**
+   * The document to store: pdf-lib's own rewrite of the upload, not the
+   * upload. See normalizeForStorage.
+   */
+  body: Uint8Array;
   encrypted: boolean;
   filename: string;
   pageCount: number;
@@ -146,11 +151,50 @@ function maybeContainsEncrypt(body: Uint8Array): boolean {
   return prefix.includes("/Encrypt");
 }
 
+/**
+ * Rewrites an upload into the file that is stored as the envelope's source.
+ *
+ * A signer is shown the source with pdf.js, and the signed copy is made by
+ * pdf-lib reading the same file. The two do not read every PDF alike: an
+ * object defined twice is one thing to pdf.js, which follows the
+ * cross-reference table, and another to pdf-lib, which keeps the last
+ * definition in the file; a form field is drawn from its value by pdf.js and
+ * from its stored appearance when pdf-lib flattens it. A file made to be
+ * read both ways would show a signer one document and seal another.
+ *
+ * So the upload is read once by pdf-lib, its form is flattened the way the
+ * signed copy flattens it, and what pdf-lib writes back is the source: one
+ * definition of each object, one cross-reference table, nothing after the
+ * end. That file is what is stored, hashed, shown and sealed.
+ */
+async function normalizeForStorage(body: Uint8Array): Promise<Uint8Array> {
+  const document = await PDFDocument.load(body, {
+    ignoreEncryption: false,
+    updateMetadata: false,
+  });
+
+  if (document.getPageCount() > MAX_PDF_PAGES) {
+    throw new DocumentImportError("too_many_pages");
+  }
+
+  if (document.catalog.has(PDFName.of("AcroForm"))) {
+    try {
+      document.getForm().flatten();
+    } catch {
+      // A form pdf-lib cannot flatten stays as it is, as it does when the
+      // signed copy is made. The stored file is still pdf-lib's rewrite.
+    }
+  }
+
+  return document.save({ useObjectStreams: false });
+}
+
 async function parsePdfDocument(
   body: Uint8Array,
 ): Promise<{ pages: ImportedPdfPage[]; pureXfa: boolean }> {
   const document = await PDFDocument.load(body, {
     ignoreEncryption: false,
+    updateMetadata: false,
   });
 
   if (document.getPageCount() > MAX_PDF_PAGES) {
@@ -183,13 +227,13 @@ export async function importPdfDocument({
   maxSizeBytes = DEFAULT_DOCUMENT_IMPORT_LIMITS.maxSizeBytes,
 }: ImportPdfDocumentInput): Promise<ImportedPdfDocument> {
   const normalizedFilename = filename.trim() || "document.pdf";
-  const sizeBytes = body.length;
+  const uploadSizeBytes = body.length;
 
   assertImportRequest({
     contentType,
     filename: normalizedFilename,
     maxSizeBytes,
-    sizeBytes,
+    sizeBytes: uploadSizeBytes,
   });
 
   if (!looksLikePdf(body)) {
@@ -198,27 +242,39 @@ export async function importPdfDocument({
 
   const containsEncrypt = maybeContainsEncrypt(body);
   const containsXfa = maybeContainsXfa(body);
-  const sourceHash = hashDocument(body);
 
   if (containsEncrypt) {
     throw new DocumentImportError("encrypted_pdf");
   }
 
   try {
-    const { pages, pureXfa } = await parsePdfDocument(body.slice());
+    if (containsXfa) {
+      throw new DocumentImportError("unsupported_variant");
+    }
 
-    if (pureXfa || containsXfa) {
+    const storedBody = await normalizeForStorage(body.slice());
+
+    // The rewrite can come out larger than the upload.
+    if (storedBody.length > maxSizeBytes) {
+      throw new DocumentImportError("too_large");
+    }
+
+    // Page sizes are read from the stored file, the one the browser draws.
+    const { pages, pureXfa } = await parsePdfDocument(storedBody.slice());
+
+    if (pureXfa) {
       throw new DocumentImportError("unsupported_variant");
     }
 
     return {
+      body: storedBody,
       encrypted: false,
       filename: normalizedFilename,
       pageCount: pages.length,
       pages,
       pureXfa,
-      sizeBytes,
-      sourceHash,
+      sizeBytes: storedBody.length,
+      sourceHash: hashDocument(storedBody),
     };
   } catch (error) {
     if (error instanceof DocumentImportError) {
