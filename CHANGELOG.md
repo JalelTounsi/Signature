@@ -26,6 +26,10 @@ Four fixes to how 0.9.0 keeps its records. This changes the database: run
   work again. If you changed the secret after the site had sealed a
   document, open Settings after this update: see
   [docs/self-hosting.md](docs/self-hosting.md).
+- The migration runner records a checksum of every migration it applies
+  and refuses to run, naming the file, when an applied migration has been
+  edited since. An existing database gets its checksums on the first run
+  and is not refused.
 
 ## [0.9.0] - 2026-11-22
 

@@ -2,6 +2,11 @@
 // Applies db/migrations/*.sql in filename order and records each one in the
 // signudoc_migrations table. Safe to run repeatedly: applied files are skipped.
 //
+// Each applied file is recorded with a checksum of its content. A published
+// migration is never edited (a change goes in a new one), so when an applied
+// file no longer matches its checksum the run stops and names it, before
+// anything else is applied.
+//
 //   node db/migrate.mjs             apply pending migrations (fails without a database URL)
 //   node db/migrate.mjs --optional  same, but exits cleanly when no database URL is set
 //
@@ -9,6 +14,7 @@
 // database for production builds unless MIGRATE_ON_PREVIEW=1 is set, because
 // preview deployments share the production database unless each preview has
 // its own database branch.
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -38,6 +44,14 @@ export async function listMigrationFiles(
   return entries.filter((entry) => entry.endsWith(".sql")).sort();
 }
 
+/**
+ * What a migration file contained. Line endings are left out of it, so a
+ * checkout that turns them into CRLF is still the same file.
+ */
+export function migrationChecksum(sql) {
+  return createHash("sha256").update(sql.replace(/\r\n/g, "\n")).digest("hex");
+}
+
 export async function runMigrations({
   connectionString,
   log = console.log,
@@ -60,31 +74,62 @@ export async function runMigrations({
       )
     `);
 
-    const appliedResult = await client.query(
-      "select version from public.signudoc_migrations",
+    // Databases migrated before checksums were kept have rows without one.
+    await client.query(
+      "alter table public.signudoc_migrations add column if not exists checksum text",
     );
-    const appliedVersions = new Set(
-      appliedResult.rows.map((row) => row.version),
+
+    const appliedResult = await client.query(
+      "select version, checksum from public.signudoc_migrations",
+    );
+    const appliedChecksums = new Map(
+      appliedResult.rows.map((row) => [row.version, row.checksum]),
     );
     const files = await listMigrationFiles(migrationsDir);
-    const applied = [];
+    const pending = [];
+    const withoutChecksum = [];
 
+    // Every applied file is checked before anything is applied.
     for (const file of files) {
       const version = file.replace(/\.sql$/, "");
+      const sql = await readFile(path.join(migrationsDir, file), "utf8");
+      const checksum = migrationChecksum(sql);
 
-      if (appliedVersions.has(version)) {
+      if (!appliedChecksums.has(version)) {
+        pending.push({ checksum, file, sql, version });
         continue;
       }
 
-      const sql = await readFile(path.join(migrationsDir, file), "utf8");
+      const recorded = appliedChecksums.get(version);
 
+      if (recorded === null) {
+        withoutChecksum.push({ checksum, version });
+      } else if (recorded !== checksum) {
+        throw new Error(
+          `Migration ${file} was changed after it was applied to this database (recorded checksum ${recorded}, the file now has ${checksum}). A published migration is never edited: put the file back as it was and make the change in a new migration.`,
+        );
+      }
+    }
+
+    // Applied by a runner that kept no checksum: what the file holds now is
+    // taken as what ran, so later edits are caught.
+    for (const { checksum, version } of withoutChecksum) {
+      await client.query(
+        "update public.signudoc_migrations set checksum = $2 where version = $1 and checksum is null",
+        [version, checksum],
+      );
+    }
+
+    const applied = [];
+
+    for (const { checksum, file, sql, version } of pending) {
       await client.query("begin");
 
       try {
         await client.query(sql);
         await client.query(
-          "insert into public.signudoc_migrations (version) values ($1)",
-          [version],
+          "insert into public.signudoc_migrations (version, checksum) values ($1, $2)",
+          [version, checksum],
         );
         await client.query("commit");
       } catch (error) {
